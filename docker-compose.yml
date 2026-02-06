@@ -1,0 +1,40 @@
+services:
+  db:
+    image: postgres:15-alpine
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=password
+      - POSTGRES_DB=fullstack_db
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://postgres:password@db:5432/fullstack_db
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - ./backend/app:/app/app # Hot reload for dev
+
+  frontend:
+    image: node:20-alpine
+    working_dir: /app
+    # In a real scenario, we would mount the frontend code and run 'npm run dev'
+    # For this scaffolding, we keep the container alive to allow exec
+    command: sh -c "echo 'Frontend placeholder ready' && tail -f /dev/null"
+    ports:
+      - "3000:3000"
+
+volumes:
+  postgres_data:
