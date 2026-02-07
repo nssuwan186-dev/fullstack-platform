@@ -23,9 +23,11 @@ jobs:
       working-directory: ./backend
       run: uv sync --dev
 
-    - name: Build Package (Wheel)
+    - name: Build Package
       working-directory: ./backend
-      run: uv build
+      run: |
+        pip install build
+        python -m build
 
     - name: Run Unit Tests
       working-directory: ./backend
