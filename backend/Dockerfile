@@ -2,24 +2,19 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# ติดตั้ง uv
+# ติดตั้ง uv (มาตรฐานใหม่สำหรับ Virtual Environments ตาม docs)
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv
 
-# 1. เตรียม Dependencies (Layer caching)
+# 1. สร้างและจัดการ Virtual Environment
 COPY pyproject.toml .
 RUN uv sync --frozen --no-dev
 
-# 2. Copy Source และ Build เป็น Package
+# 2. ติดตั้ง Source Code
 COPY app ./app
-COPY README.md .
+COPY README.md . 
 
-# ติดตั้งโปรเจกต์ตัวเองเป็น Package (ตาม uv documentation ที่ส่งมา)
-# วิธีนี้จะสร้าง .dist-info ทำให้ตรวจสอบความสมบูรณ์ได้ง่าย
-RUN uv pip install .
+# สร้างโฟลเดอร์สำหรับเก็บผลลัพธ์
+RUN mkdir -p output
 
-# 3. ตรวจสอบความสมบูรณ์ก่อนรัน (Health Check Script)
-RUN python -c "import os; \
-    exists = any(d.endswith('.dist-info') for d in os.listdir('/app/.venv/lib/python3.12/site-packages')); \
-    print('Dependencies Verified' if exists else exit(1))"
-
+# 3. รันผ่าน uv (ซึ่งจะเรียกใช้ Virtual Environment ที่สร้างไว้โดยอัตโนมัติ)
 CMD ["uv", "run", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

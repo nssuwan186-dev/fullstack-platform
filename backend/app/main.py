@@ -1,112 +1,89 @@
-from fastapi import FastAPI, Request, status
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks, Request
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import structlog
-import time
+import os
+from pathlib import Path
 
 from app import database, models, schemas
 from app.config import settings
-from app.api import router # เดี๋ยวเราจะย้าย Route ไปไฟล์แยกเพื่อความเป็นระเบียบ
+from app.processor import DataProcessor
+from app.security import DataPolicyEngine
+from app.auth import get_current_user
 
-# --- Logging Configuration ---
-structlog.configure(
-    processors=[
-        structlog.processors.TimeStamper(fmt="iso"),
-        structlog.processors.JSONRenderer()
-    ]
-)
+# --- Logging ---
+structlog.configure(processors=[structlog.processors.TimeStamper(fmt="iso"), structlog.processors.JSONRenderer()])
 log = structlog.get_logger()
 
-# --- Lifespan (Startup/Shutdown) ---
+# --- Lifespan ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    log.info("startup_initiated")
-    
-    # 1. รอ Database
+    log.info("startup")
     await database.wait_for_db()
-    
-    # 2. สร้างตาราง (Auto-migrate สำหรับ Dev)
     async with database.engine.begin() as conn:
         await conn.run_sync(models.Base.metadata.create_all)
-        
-    log.info("startup_complete")
     yield
-    log.info("shutdown_initiated")
     await database.engine.dispose()
-    log.info("shutdown_complete")
+    log.info("shutdown")
 
-# --- App Init ---
-app = FastAPI(
-    title=settings.PROJECT_NAME,
-    version=settings.VERSION,
-    lifespan=lifespan,
-    docs_url="/docs",
-)
+app = FastAPI(title=settings.PROJECT_NAME, lifespan=lifespan)
 
-# --- Middleware ---
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# --- Middleware & Static Files ---
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-@app.middleware("http")
-async def logging_middleware(request: Request, call_next):
-    start_time = time.time()
-    try:
-        response = await call_next(request)
-        process_time = time.time() - start_time
-        log.info(
-            "api_request",
-            method=request.method,
-            path=request.url.path,
-            status=response.status_code,
-            duration=f"{process_time:.4f}s"
-        )
-        return response
-    except Exception as e:
-        log.error("request_failed", error=str(e), path=request.url.path)
-        raise
+# สร้างโฟลเดอร์ Output และ Mount สำหรับเข้าถึงไฟล์
+OUTPUT_DIR = Path("output")
+OUTPUT_DIR.mkdir(exist_ok=True)
+app.mount("/static", StaticFiles(directory="output"), name="static")
 
-# --- Global Error Handlers ---
-@app.exception_handler(Exception)
-async def global_exception_handler(request: Request, exc: Exception):
-    log.error("unhandled_exception", error=str(exc))
-    return JSONResponse(
-        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-        content={"detail": "Internal Server Error. We are monitoring this issue."},
-    )
+processor = DataProcessor(output_dir=str(OUTPUT_DIR))
+policy_engine = DataPolicyEngine()
 
-# --- Routes ---
-# เราจะย้าย Logic เดิมไปไว้ที่ Route แยก เพื่อไม่ให้ main.py รก
-from fastapi import APIRouter, Depends
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+# --- Endpoints ---
 
-api_router = APIRouter()
+@app.get("/health")
+async def health():
+    return {"status": "online", "parallel_mode": "enabled"}
 
-@api_router.get("/")
-async def root():
-    return {"message": "System is running", "status": "healthy"}
-
-@api_router.post("/users/", response_model=schemas.User)
-async def create_user(user: schemas.UserCreate, db: AsyncSession = Depends(database.get_db)):
-    # ... logic เดิม ...
-    result = await db.execute(select(models.User).where(models.User.email == user.email))
-    if result.scalar_one_or_none():
-         # คืนค่า Error ที่ถูกต้อง ไม่ใช่ 500
-         return JSONResponse(
-             status_code=400, 
-             content={"detail": "Email already exists"}
-         )
+@app.post("/process/excel", status_code=202)
+async def process_excel(
+    data: list[dict], 
+    background_tasks: BackgroundTasks, 
+    user=Depends(get_current_user)
+):
+    """
+    ใช้ BackgroundTasks เพื่อทำ Parallelism (ไม่รอให้ประมวลผลเสร็จแล้วค่อยตอบ)
+    ระบบจะตอบรับทันที (202 Accepted) และไปรันงานหนักข้างหลัง
+    """
+    log.info("task_received", type="excel", user=user["username"])
     
-    new_user = models.User(email=user.email, hashed_password=user.password + "hash")
-    db.add(new_user)
-    await db.commit()
-    await db.refresh(new_user)
-    return new_user
+    # ดำเนินการคัดกรองข้อมูลทันที (Fast)
+    clean_data = policy_engine.process_mixed_data(data)
+    
+    # ส่งงานหนัก (CPU Bound) ไปทำใน Background thread
+    filename = f"secure_{user['username']}_{os.urandom(4).hex()}.xlsx"
+    background_tasks.add_task(processor.process_excel_with_formulas, clean_data, filename)
+    
+    return {
+        "message": "Task accepted and processing in background",
+        "expected_file": filename,
+        "download_url": f"/files/{filename}"
+    }
 
-app.include_router(api_router, prefix=settings.API_V1_STR)
+@app.get("/files/{file_path:path}")
+async def get_processed_file(file_path: str):
+    """
+    ใช้ Path Convertor ({file_path:path}) เพื่อรองรับชื่อไฟล์ที่มี / หรือโครงสร้างซับซ้อน
+    """
+    full_path = OUTPUT_DIR / file_path
+    if not full_path.exists():
+        log.error("file_not_found", path=str(full_path))
+        raise HTTPException(status_code=404, detail="File not found")
+    
+    return FileResponse(path=full_path, filename=file_path)
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
