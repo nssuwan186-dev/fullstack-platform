@@ -72,17 +72,29 @@ async def process_excel(
         "download_url": f"/files/{filename}"
     }
 
-@app.get("/files/{file_path:path}")
-async def get_processed_file(file_path: str):
+@app.get("/users/search", response_model=list[schemas.User], dependencies=[Depends(get_current_user)])
+async def search_users(
+    q: str | None = None, 
+    is_active: bool = True, 
+    skip: int = 0, 
+    limit: int = 10,
+    db: AsyncSession = Depends(database.get_db)
+):
     """
-    ใช้ Path Convertor ({file_path:path}) เพื่อรองรับชื่อไฟล์ที่มี / หรือโครงสร้างซับซ้อน
+    ค้นหา User พร้อมระบบ Type Conversion:
+    - is_active: แปลงจาก 'true', '1', 'on' เป็น True อัตโนมัติ
+    - skip, limit: แปลงเป็น int และตรวจสอบว่าเป็นตัวเลขหรือไม่
     """
-    full_path = OUTPUT_DIR / file_path
-    if not full_path.exists():
-        log.error("file_not_found", path=str(full_path))
-        raise HTTPException(status_code=404, detail="File not found")
+    log.info("user_search", query=q, is_active=is_active, limit=limit)
     
-    return FileResponse(path=full_path, filename=file_path)
+    query = select(models.User).where(models.User.is_active == is_active)
+    
+    if q:
+        query = query.where(models.User.email.contains(q))
+    
+    result = await db.execute(query.offset(skip).limit(limit))
+    users = result.scalars().all()
+    return users
 
 if __name__ == "__main__":
     import uvicorn
